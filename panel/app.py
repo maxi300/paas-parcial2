@@ -1,27 +1,44 @@
 # Panel PaaS (tipo Render) · Parcial 2
 # El cliente da 4 valores (dominio, repositorio Git, runtime/puerto y base de datos);
 # la plataforma completa el resto con el chart de Helm (TLS, BD, Secrets, HPA, middleware).
-import base64, os, re, shutil, subprocess, threading, time
+import base64, json, os, re, shutil, subprocess, threading, time
 from datetime import datetime
 from pathlib import Path
 
 import yaml
-from flask import Flask, Response, abort, flash, redirect, render_template, request, url_for
+from flask import Flask, Response, abort, flash, g, redirect, render_template, request, url_for
 from jinja2 import DictLoader
+from werkzeug.security import check_password_hash, generate_password_hash
 
 HOME = Path.home()
 CHART = Path(os.environ.get("PAAS_CHART", HOME / "paas-app-chart-v2"))
 BUILDS = Path(os.environ.get("PAAS_BUILDS", HOME / "paas-builds"))
+CERTS = Path(os.environ.get("PAAS_CERTS", HOME / "certs"))          # CA propia (OpenSSL) para firmar certificados
+REGISTRO = CHART / "clientes.json"                                    # clientes creados desde el panel
 REPO = "https://github.com/maxi300/paas-parcial2.git"
-PANEL_USER = os.environ.get("PANEL_USER", "admin")
-PANEL_PASSWORD = os.environ.get("PANEL_PASSWORD", "paas2026")
+# Usuarios: el dueño de la plataforma ve y administra todo; cada cliente solo ve su app.
+USUARIOS = {
+    "admin": (os.environ.get("PANEL_PASSWORD", "paas2026"), None),
+    "alpha": (os.environ.get("ALPHA_PASSWORD", "alpha2026"), "alpha"),
+    "beta": (os.environ.get("BETA_PASSWORD", "beta2026"), "beta"),
+}
 
 CLIENTES = {
-    "alpha": {"nombre": "Alpha Tech", "release": "mi-app", "ns": "portal-clientes",
+    "alpha": {"nombre": "Alpha Tech", "release": "mi-app", "ns": "portal-clientes", "plan": "pro",
               "archivo": CHART / "values-portal.yaml", "path": "apps/alpha-node"},
-    "beta": {"nombre": "Beta POS", "release": "mi-app-pos", "ns": "pos-ventas",
+    "beta": {"nombre": "Beta POS", "release": "mi-app-pos", "ns": "pos-ventas", "plan": "basico",
              "archivo": CHART / "values-pos.yaml", "path": "apps/beta-php"},
 }
+# Planes (como los "instance types" de Render): definen escala, recursos, disco, límite de solicitudes y cuota
+PLANES = {
+    "basico": {"label": "Básico", "hpa": (1, 3), "storage": "1Gi", "rpm": 120,
+               "quota": {"pods": "8", "requests.cpu": "2", "requests.memory": "2Gi", "limits.cpu": "4",
+                         "limits.memory": "4Gi", "requests.storage": "5Gi"}},
+    "pro": {"label": "Pro", "hpa": (2, 5), "storage": "2Gi", "rpm": 600,
+            "quota": {"pods": "10", "requests.cpu": "2", "requests.memory": "4Gi", "limits.cpu": "4",
+                      "limits.memory": "8Gi", "requests.storage": "10Gi"}},
+}
+RESERVADOS = {"admin", "registro", "default", "monitoring", "ingress-nginx", "portal-clientes", "pos-ventas"}
 RUNTIMES = {
     "node": {"label": "Node.js", "port": 3000, "live": "/health", "ready": "/ready"},
     "php": {"label": "PHP + Apache", "port": 8080, "live": "/health.php", "ready": "/health.php?ready=1"},
@@ -38,6 +55,8 @@ RE = {
     "env": re.compile(r"^[A-Z_][A-Z0-9_]*$"),
     "body": re.compile(r"^\d+[km]$"),
     "tag": re.compile(r"^[A-Za-z0-9._-]{1,60}$"),
+    "slug": re.compile(r"^[a-z][a-z0-9-]{2,18}[a-z0-9]$"),
+    "color": re.compile(r"^#[0-9a-fA-F]{6}$"),
 }
 
 app = Flask(__name__)
@@ -47,21 +66,41 @@ JOBS = {}                 # cliente -> {"estado", "log", "inicio", "tipo"}
 
 
 # ------------------------------------------------------------------ utilidades
-def run(cmd, timeout=60, cwd=None):
+def run(cmd, timeout=60, cwd=None, entrada=None):
     """Ejecuta un comando sin shell y devuelve (código, salida)."""
     if shutil.which(cmd[0]) is None:
         return 127, f"'{cmd[0]}' no está instalado."
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, input=entrada)
         return p.returncode, (p.stdout + p.stderr).strip()
     except subprocess.TimeoutExpired:
         return 124, "Tiempo de espera agotado."
 
 
+def leer_registro():
+    try:
+        return json.loads(REGISTRO.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def escribir_registro(reg):
+    REGISTRO.write_text(json.dumps(reg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def clientes():
+    """Clientes fijos (Alpha y Beta) + los creados desde el panel."""
+    todos = dict(CLIENTES)
+    for cid, r in leer_registro().items():
+        todos[cid] = {**r, "archivo": CHART / r["archivo"]}
+    return todos
+
+
 def cliente(cid):
-    if cid not in CLIENTES:
+    todos = clientes()
+    if cid not in todos:
         abort(404)
-    return CLIENTES[cid]
+    return todos[cid]
 
 
 def cargar(cid):
@@ -81,20 +120,41 @@ def guardar(cid, v):
 
 def helm_cmd(cid, extra=()):
     c = cliente(cid)
-    return ["helm", "upgrade", c["release"], str(CHART), "-f", str(c["archivo"]), "-n", c["ns"], *extra]
+    return ["helm", "upgrade", "--install", c["release"], str(CHART), "-f", str(c["archivo"]), "-n", c["ns"], *extra]
 
 
 def fuente(v, cid):
     s = v.get("source") or {}
     return {"repo": s.get("repo", REPO), "branch": s.get("branch", "main"),
-            "path": s.get("path", CLIENTES[cid]["path"]), "commit": s.get("commit", "")}
+            "path": s.get("path", cliente(cid)["path"]), "commit": s.get("commit", "")}
 
 
 @app.before_request
 def autenticar():
+    if request.endpoint == "registro":
+        g.usuario, g.alcance = "", "nuevo"
+        return None   # crear cuenta es público, como en Render
     a = request.authorization
-    if not a or a.username != PANEL_USER or a.password != PANEL_PASSWORD:
-        return Response("Acceso restringido", 401, {"WWW-Authenticate": 'Basic realm="Panel PaaS"'})
+    u = USUARIOS.get(a.username) if a else None
+    alcance = False
+    if u and a.password == u[0]:
+        alcance = u[1]
+    elif a:
+        r = leer_registro().get(a.username)
+        if r and check_password_hash(r["clave"], a.password):
+            alcance = a.username
+    if alcance is False:
+        return Response('Acceso restringido. ¿No tienes cuenta? <a href="/registro">Crea tu app aquí</a>', 401,
+                        {"WWW-Authenticate": 'Basic realm="Panel PaaS"', "Content-Type": "text/html; charset=utf-8"})
+    g.usuario, g.alcance = a.username, alcance
+    cid = (request.view_args or {}).get("cid")
+    if g.alcance and cid and cid != g.alcance:
+        abort(403)   # un cliente no puede ver ni tocar la app de otro cliente
+
+
+@app.context_processor
+def sesion():
+    return {"usuario": getattr(g, "usuario", ""), "dueno": getattr(g, "alcance", 1) is None}
 
 
 # ------------------------------------------------------------------ trabajos en segundo plano
@@ -137,7 +197,7 @@ def pasos_aplicar(cid):
     c = cliente(cid)
     dep = f"deploy/{c['release']}-paas-app-chart"
     return [
-        ("helm upgrade (aplicar values.yaml)", paso_cmd(helm_cmd(cid, ["--wait", "--timeout", "5m"]), 400)),
+        ("helm upgrade --install (aplicar values.yaml)", paso_cmd(helm_cmd(cid, ["--wait", "--timeout", "8m"]), 560)),
         ("Esperar a que los pods nuevos estén listos", paso_cmd(["kubectl", "rollout", "status", dep, "-n", c["ns"], "--timeout=300s"], 320)),
         ("Estado final", paso_cmd(["kubectl", "get", "pods", "-n", c["ns"]], 30)),
     ]
@@ -165,6 +225,8 @@ def pasos_git(cid):
         if not (ctx / "Dockerfile").exists():
             return False, f"No hay Dockerfile en {src['path']}"
         _, nodos = run(["kubectl", "get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"], 30)
+        if not nodos.split():
+            return False, "No pude listar los nodos del clúster."
         salida = []
         imagen = f"{v['image']['repository']}:{estado['tag']}"
         for nodo in nodos.split():
@@ -192,8 +254,164 @@ def pasos_git(cid):
             ("Limpiar carpeta temporal", limpiar)]
 
 
+# ------------------------------------------------------------------ alta de un cliente nuevo (tipo Render)
+def gobierno_yaml(cid, plan):
+    """Cuota, límites por defecto y aislamiento de red del namespace del cliente."""
+    q = "\n".join(f"    {k}: \"{v}\"" for k, v in PLANES[plan]["quota"].items())
+    return f"""apiVersion: v1
+kind: ResourceQuota
+metadata: {{name: {cid}-quota}}
+spec:
+  hard:
+{q}
+---
+apiVersion: v1
+kind: LimitRange
+metadata: {{name: paas-defaults}}
+spec:
+  limits:
+  - type: Container
+    default: {{cpu: 500m, memory: 256Mi}}
+    defaultRequest: {{cpu: 100m, memory: 128Mi}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {{name: isolate-namespace}}
+spec:
+  podSelector: {{}}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector: {{}}
+    - namespaceSelector: {{matchLabels: {{kubernetes.io/metadata.name: ingress-nginx}}}}
+    - namespaceSelector: {{matchLabels: {{kubernetes.io/metadata.name: monitoring}}}}
+"""
+
+
+def values_nuevos(cid, nombre, repo, branch, path, runtime, port, motor, plan, color):
+    r, p = RUNTIMES[runtime], PLANES[plan]
+    db = {"enabled": True, "engine": motor, "version": "16-alpine" if motor == "postgres" else "8.4",
+          "name": f"{cid.replace('-', '_')}_db", "user": f"{cid.replace('-', '_')}_user", "storage": p["storage"]}
+    if motor == "mysql":
+        db["resources"] = {"requests": {"cpu": "100m", "memory": "384Mi"}, "limits": {"cpu": "500m", "memory": "768Mi"}}
+    return {
+        "runtime": runtime, "image": {"repository": f"{cid}-app", "tag": "pendiente"}, "containerPort": port,
+        "domain": f"{cid}.paas.local",
+        "env": {"APP_NAME": nombre, "TENANT": cid, "APP_ENV": "produccion", "BRAND_COLOR": color},
+        "autoscaling": {"enabled": True, "minReplicas": p["hpa"][0], "maxReplicas": p["hpa"][1], "targetCPU": 70},
+        "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "500m", "memory": "256Mi"}},
+        "livenessProbe": {"httpGet": {"path": r["live"], "port": "http"}, "initialDelaySeconds": 10},
+        "readinessProbe": {"httpGet": {"path": r["ready"], "port": "http"}, "initialDelaySeconds": 5},
+        "database": db, "dbAdmin": {"enabled": True}, "tls": {"enabled": True, "secretName": f"{cid}-tls"},
+        "middleware": {"sslRedirect": False, "rateLimitRPM": p["rpm"], "stickySessions": False,
+                       "proxyBodySize": "2m", "cors": False},
+        "source": {"repo": repo, "branch": branch, "path": path},
+    }
+
+
+def pasos_crear(cid, plan):
+    dominio = f"{cid}.paas.local"
+
+    def namespace():
+        code, out = run(["kubectl", "create", "namespace", cid], 30)
+        if code != 0:
+            return False, out
+        _, out2 = run(["kubectl", "label", "namespace", cid, f"paas/tenant={cid}", f"paas/plan={plan}"], 30)
+        return True, out + "\n" + out2
+
+    def gobierno():
+        code, out = run(["kubectl", "apply", "-n", cid, "-f", "-"], 30, entrada=gobierno_yaml(cid, plan))
+        return code == 0, out
+
+    def certificado():
+        ca, cakey = CERTS / "ca.crt", CERTS / "ca.key"
+        if not (ca.exists() and cakey.exists()):
+            return False, f"No encuentro la CA en {CERTS} (ca.crt y ca.key)."
+        key, csr, crt, ext = (CERTS / f"{cid}.{e}" for e in ("key", "csr", "crt", "ext"))
+        ext.write_text(f"subjectAltName=DNS:{dominio},DNS:db.{dominio}\nbasicConstraints=CA:FALSE\n"
+                       "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n")
+        salida = []
+        for cmd in (["openssl", "genrsa", "-out", str(key), "2048"],
+                    ["openssl", "req", "-new", "-key", str(key), "-subj", f"/C=SV/O=PaaS Local/CN={dominio}", "-out", str(csr)],
+                    ["openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(cakey), "-CAcreateserial",
+                     "-out", str(crt), "-days", "365", "-sha256", "-extfile", str(ext)],
+                    ["kubectl", "create", "secret", "tls", f"{cid}-tls", f"--cert={crt}", f"--key={key}", "-n", cid]):
+            code, out = run(cmd, 60)
+            salida.append("$ " + " ".join(cmd[:4]) + " …\n" + out)
+            if code != 0:
+                return False, "\n".join(salida)
+        return True, "\n".join(salida)
+
+    return [(f"Crear namespace {cid} (aislado)", namespace),
+            (f"Cuota del plan {PLANES[plan]['label']}, LimitRange y NetworkPolicy", gobierno),
+            (f"Certificado SSL para {dominio} y db.{dominio} firmado por la CA propia (OpenSSL)", certificado),
+            *pasos_git(cid)]
+
+
+@app.route("/registro", methods=["GET", "POST"])
+def registro():
+    f = request.form
+    if request.method == "POST":
+        err = []
+        cid = f.get("cid", "").strip().lower()
+        if not RE["slug"].match(cid) or cid in RESERVADOS or cid in clientes() or cid.startswith("kube-"):
+            err.append("Nombre no válido o ya existe (4-20 letras minúsculas, números o guiones).")
+        elif run(["kubectl", "get", "namespace", cid], 20)[0] == 0:
+            err.append(f"Ya existe un namespace llamado {cid}.")
+        nombre = f.get("nombre", "").strip()[:40] or cid
+        clave = f.get("clave", "")
+        if len(clave) < 6:
+            err.append("La contraseña debe tener al menos 6 caracteres.")
+        repo, branch, path = f.get("repo", "").strip(), f.get("branch", "main").strip(), f.get("path", "").strip()
+        if not RE["repo"].match(repo) or not RE["ref"].match(branch) or not RE["ref"].match(path):
+            err.append("Revisa el repositorio, la rama y la carpeta.")
+        runtime, motor, plan = f.get("runtime"), f.get("motor"), f.get("plan")
+        if runtime not in RUNTIMES or motor not in MOTORES or plan not in PLANES:
+            err.append("Elige runtime, base de datos y plan.")
+        color = f.get("color", "#7c5cff")
+        color = color if RE["color"].match(color) else "#7c5cff"
+        try:
+            port = int(f.get("port") or RUNTIMES.get(runtime, {}).get("port", 80))
+        except ValueError:
+            port = 0
+        if not 1 <= port <= 65535:
+            err.append("Puerto no válido.")
+        if err:
+            for e in err:
+                flash(e, "error")
+            return render_template("registro.html", f=f, runtimes=RUNTIMES, motores=MOTORES, planes=PLANES)
+        archivo = f"values-{cid}.yaml"
+        reg = leer_registro()
+        reg[cid] = {"nombre": nombre, "release": cid, "ns": cid, "plan": plan, "archivo": archivo, "path": path,
+                    "clave": generate_password_hash(clave), "creado": f"{datetime.now():%Y-%m-%d %H:%M}"}
+        escribir_registro(reg)
+        guardar_nuevo = values_nuevos(cid, nombre, repo, branch, path, runtime, port, motor, plan, color)
+        (CHART / archivo).write_text(f"# Valores del cliente {nombre} · creado desde el Panel PaaS\n"
+                                     + yaml.safe_dump(guardar_nuevo, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        lanzar(cid, "Crear app nueva", pasos_crear(cid, plan))
+        return render_template("creada.html", cid=cid, nombre=nombre, ip=request.host.split(":")[0])
+    return render_template("registro.html", f={}, runtimes=RUNTIMES, motores=MOTORES, planes=PLANES)
+
+
+@app.route("/c/<cid>/eliminar", methods=["POST"])
+def eliminar(cid):
+    c = cliente(cid)
+    if g.alcance or cid in CLIENTES:
+        abort(403)   # solo el dueño, y solo clientes creados desde el panel
+    run(["helm", "uninstall", c["release"], "-n", c["ns"]], 120)
+    run(["kubectl", "delete", "namespace", c["ns"], "--wait=false"], 60)
+    reg = leer_registro()
+    reg.pop(cid, None)
+    escribir_registro(reg)
+    if c["archivo"].exists():
+        c["archivo"].rename(c["archivo"].with_suffix(".eliminado"))
+    JOBS.pop(cid, None)
+    flash(f"Cliente {c['nombre']} eliminado (namespace {c['ns']} en borrado).", "ok")
+    return redirect(url_for("inicio"))
+
+
 # ------------------------------------------------------------------ formulario -> values
-def aplicar_formulario(f, v):
+def aplicar_formulario(f, v, dueno=True):
     err = []
 
     def texto(campo, regex, etiqueta):
@@ -212,8 +430,9 @@ def aplicar_formulario(f, v):
         err.append(f"«{etiqueta}» debe ser un número entre {lo} y {hi}.")
         return lo
 
-    # Los 4 valores del cliente
-    v["domain"] = texto("domain", RE["host"], "Dominio")
+    # Los 4 valores del cliente (el dominio solo lo cambia el dueño: requiere certificado y DNS)
+    if dueno:
+        v["domain"] = texto("domain", RE["host"], "Dominio")
     v["source"] = {**(v.get("source") or {}),
                    "repo": texto("repo", RE["repo"], "Repositorio Git"),
                    "branch": texto("branch", RE["ref"], "Rama"),
@@ -227,9 +446,6 @@ def aplicar_formulario(f, v):
         v["livenessProbe"] = {"httpGet": {"path": r["live"], "port": "http"}, "initialDelaySeconds": 10}
         v["readinessProbe"] = {"httpGet": {"path": r["ready"], "port": "http"}, "initialDelaySeconds": 5}
     v["containerPort"] = numero("port", 1, 65535, "Puerto")
-
-    # Opciones avanzadas
-    v["image"]["tag"] = texto("tag", RE["tag"], "Etiqueta de imagen")
     env = {}
     for linea in f.get("env", "").splitlines():
         linea = linea.strip()
@@ -241,6 +457,11 @@ def aplicar_formulario(f, v):
             continue
         env[k.strip()] = val.strip()
     v["env"] = env
+    if not dueno:
+        return err   # escala, recursos y middleware los define el plan (solo el dueño)
+
+    # Opciones avanzadas (dueño de la plataforma)
+    v["image"]["tag"] = texto("tag", RE["tag"], "Etiqueta de imagen")
     a = v.setdefault("autoscaling", {})
     a["enabled"] = f.get("hpa") == "on"
     a["minReplicas"] = numero("hpa_min", 1, 10, "Réplicas mínimas")
@@ -267,7 +488,9 @@ def aplicar_formulario(f, v):
 @app.route("/")
 def inicio():
     tarjetas = []
-    for cid, c in CLIENTES.items():
+    for cid, c in clientes().items():
+        if g.alcance and cid != g.alcance:
+            continue
         v = cargar(cid)
         _, pods = run(["kubectl", "get", "pods", "-n", c["ns"], "--no-headers"], 20)
         lineas = [l.split() for l in pods.splitlines() if l.strip() and not l.startswith("No resources")]
@@ -280,8 +503,10 @@ def inicio():
         except Exception:  # noqa: BLE001
             helm = "sin información"
         tarjetas.append({"id": cid, "c": c, "v": v, "src": fuente(v, cid), "pods": len(lineas),
-                         "listos": listos, "helm": helm, "job": JOBS.get(cid)})
-    return render_template("inicio.html", tarjetas=tarjetas, runtimes=RUNTIMES, motores=MOTORES)
+                         "listos": listos, "helm": helm, "job": JOBS.get(cid), "nuevo": cid not in CLIENTES,
+                         "plan": PLANES.get(c.get("plan"), {}).get("label", "")})
+    return render_template("inicio.html", tarjetas=tarjetas, runtimes=RUNTIMES, motores=MOTORES,
+                           ip=request.host.split(":")[0])
 
 
 @app.route("/c/<cid>", methods=["GET", "POST"])
@@ -291,6 +516,8 @@ def editar(cid):
     if request.method == "POST":
         accion = request.form.get("accion", "guardar")
         if accion == "yaml":
+            if g.alcance:
+                abort(403)
             try:
                 v = yaml.safe_load(request.form.get("raw", "")) or {}
                 if not isinstance(v, dict):
@@ -299,7 +526,7 @@ def editar(cid):
                 flash(f"YAML no válido: {exc}", "error")
                 return redirect(url_for("editar", cid=cid))
         else:
-            errores = aplicar_formulario(request.form, v)
+            errores = aplicar_formulario(request.form, v, dueno=g.alcance is None)
             if errores:
                 for e in errores:
                     flash(e, "error")
@@ -374,7 +601,7 @@ header a{color:var(--text);text-decoration:none;font-weight:800;font-size:18px}m
 h1{font-size:24px;margin:0 0 6px}h2{font-size:15px;margin:0 0 12px;color:#b9a8ff;text-transform:uppercase;letter-spacing:.04em}
 label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
 input,select,textarea{width:100%;padding:9px 11px;border-radius:7px;border:1px solid var(--line);background:#0a0f1c;color:var(--text);font:inherit}
-textarea{font-family:ui-monospace,Consolas,monospace;font-size:13px}.chk{display:flex;gap:8px;align-items:center;margin-top:10px;font-size:14px}.chk input{width:auto}
+textarea{font-family:ui-monospace,Consolas,monospace;font-size:13px}input:disabled,select:disabled,textarea:disabled{opacity:.45;cursor:not-allowed}.chk{display:flex;gap:8px;align-items:center;margin-top:10px;font-size:14px}.chk input{width:auto}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
 .btn{display:inline-block;padding:9px 16px;border-radius:7px;border:0;background:var(--acc);color:#fff;font-weight:700;cursor:pointer;text-decoration:none;font-size:14px}
 .btn.sec{background:transparent;border:1px solid var(--line);color:var(--text)}.btn.ok{background:#16a34a}
@@ -385,16 +612,19 @@ pre{background:#05080f;padding:14px;border-radius:9px;overflow:auto;font-size:13
 a{color:#a78bfa}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
 .cuatro{border:1px solid #5b47c9;background:#17143a}table{border-collapse:collapse;width:100%}td{padding:6px 4px;border-bottom:1px solid var(--line);font-size:14px}
 </style></head><body>
-<header><a href="{{ url_for('inicio') }}">⎈ Panel PaaS</a><span class="muted">Despliegue tipo Render sobre Kubernetes · Helm · Ingress TLS</span></header>
+<header><a href="{{ url_for('inicio') }}">⎈ Panel PaaS</a><span class="muted">Despliegue tipo Render sobre Kubernetes · Helm · Ingress TLS</span>
+<span style="margin-left:auto"></span>{% if dueno %}<a class="btn" style="font-size:13px;padding:7px 12px" href="{{ url_for('registro') }}">＋ Nueva app</a>{% endif %}
+{% if usuario %}<span class="tag">{{ usuario }} · {{ 'dueño de la plataforma' if dueno else 'cliente' }}</span>{% endif %}</header>
 <main>{% with m = get_flashed_messages(with_categories=true) %}{% for cat, msg in m %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}{% endwith %}
 {% block c %}{% endblock %}</main></body></html>"""
 
 INICIO = """{% extends "base.html" %}{% block c %}
-<h1>Clientes de la plataforma</h1><p class="muted">Cada cliente vive en su propio namespace, con su base de datos, su certificado y sus límites.</p>
+{% if dueno %}<h1>Clientes de la plataforma</h1><p class="muted">Cada cliente vive en su propio namespace, con su base de datos, su certificado y sus límites.</p>
+{% else %}<h1>Mi aplicación</h1><p class="muted">Conecta tu repositorio, despliega con un clic y administra tu base de datos.</p>{% endif %}
 <div class="grid">{% for t in tarjetas %}{% set v = t.v %}
 <div class="card" style="border-top:4px solid {{ v.env.BRAND_COLOR | default('#7c5cff') }}">
  <h1 style="font-size:20px">{{ t.c.nombre }}</h1>
- <p><span class="tag">{{ runtimes[v.runtime].label if v.runtime in runtimes else v.runtime }}</span><span class="tag">{{ motores[v.database.engine] }} {{ v.database.version }}</span><span class="tag">ns {{ t.c.ns }}</span></p>
+ <p>{% if t.plan %}<span class="tag" style="border-color:#7c5cff">Plan {{ t.plan }}</span>{% endif %}<span class="tag">{{ runtimes[v.runtime].label if v.runtime in runtimes else v.runtime }}</span><span class="tag">{{ motores[v.database.engine] }} {{ v.database.version }}</span><span class="tag">ns {{ t.c.ns }}</span></p>
  <table>
   <tr><td class="muted">Estado</td><td><span class="dot" style="background:{{ '#22c55e' if t.pods and t.listos == t.pods else '#f59e0b' }}"></span>{{ t.listos }}/{{ t.pods }} pods listos · {{ t.helm }}</td></tr>
   <tr><td class="muted">Sitio</td><td><a href="http://{{ v.domain }}" target="_blank">http://{{ v.domain }}</a><br><a href="https://{{ v.domain }}" target="_blank">https://{{ v.domain }}</a></td></tr>
@@ -407,14 +637,16 @@ INICIO = """{% extends "base.html" %}{% block c %}
  {% if t.job %}<p class="muted">Último trabajo: <a href="{{ url_for('trabajo', cid=t.id) }}">{{ t.job.tipo }} · {{ t.job.estado }}</a></p>{% endif %}
  <div class="acts"><a class="btn" href="{{ url_for('editar', cid=t.id) }}">Configurar</a>
   <form method="post" action="{{ url_for('desplegar', cid=t.id) }}"><button class="btn ok">Desplegar desde Git</button></form>
-  <a class="btn sec" href="{{ url_for('estado', cid=t.id) }}">Estado</a><a class="btn sec" href="{{ url_for('credenciales', cid=t.id) }}">Credenciales BD</a></div>
+  <a class="btn sec" href="{{ url_for('estado', cid=t.id) }}">Estado</a><a class="btn sec" href="{{ url_for('credenciales', cid=t.id) }}">Credenciales BD</a>
+  {% if dueno and t.nuevo %}<form method="post" action="{{ url_for('eliminar', cid=t.id) }}" onsubmit="return confirm('¿Eliminar {{ t.c.nombre }} y todo su namespace?')"><button class="btn sec" style="color:#fca5a5">Eliminar</button></form>{% endif %}</div>
+ {% if t.nuevo %}<p class="muted">Agrega a tu archivo hosts: <code>{{ ip }} {{ v.domain }} db.{{ v.domain }}</code></p>{% endif %}
 </div>{% endfor %}</div>{% endblock %}"""
 
 EDITAR = """{% extends "base.html" %}{% block c %}
 <h1>{{ c.nombre }} <span class="muted">· release {{ c.release }} · namespace {{ c.ns }} · {{ c.archivo.name }}</span></h1>
 <form method="post"><div class="grid" style="margin-top:16px">
 <div class="card cuatro"><h2>Lo que da el cliente (4 valores)</h2>
- <label>1 · Dominio</label><input name="domain" value="{{ v.domain }}">
+ <label>1 · Dominio</label><input name="domain" value="{{ v.domain }}" {{ '' if dueno else 'disabled' }}>
  <label>2 · Repositorio Git</label><input name="repo" value="{{ src.repo }}">
  <div class="row"><div><label>Rama</label><input name="branch" value="{{ src.branch }}"></div><div><label>Carpeta con el Dockerfile</label><input name="path" value="{{ src.path }}"></div></div>
  <div class="row"><div><label>3 · Runtime</label><select name="runtime">{% for k, r in runtimes.items() %}<option value="{{ k }}" {{ 'selected' if v.runtime == k }}>{{ r.label }}</option>{% endfor %}</select></div>
@@ -424,13 +656,14 @@ EDITAR = """{% extends "base.html" %}{% block c %}
 </div>
 <div class="card"><h2>Variables de entorno</h2><textarea name="env" rows="6">{{ env_txt }}</textarea>
  <p class="muted">Una por línea, CLAVE=valor. Las credenciales de la BD no van aquí: vienen del Secret.</p>
- <label>Etiqueta de la imagen</label><input name="tag" value="{{ v.image.tag }}"><p class="muted">{{ v.image.repository }}:<b>{{ v.image.tag }}</b> · la cambia “Desplegar desde Git”.</p></div>
-<div class="card"><h2>Escalado y recursos</h2>
+ <label>Etiqueta de la imagen</label><input name="tag" value="{{ v.image.tag }}" {{ '' if dueno else 'disabled' }}><p class="muted">{{ v.image.repository }}:<b>{{ v.image.tag }}</b> · la cambia “Desplegar desde Git”.</p></div>
+<fieldset {{ '' if dueno else 'disabled' }} style="border:0;padding:0;margin:0;display:contents">
+<div class="card"><h2>Escalado y recursos</h2>{% if not dueno %}<p class="muted">Lo define tu plan (solo lo cambia el dueño de la plataforma).</p>{% endif %}
  <label class="chk"><input type="checkbox" name="hpa" {{ 'checked' if v.autoscaling.enabled }}> Autoescalado (HPA)</label>
  <div class="row3"><div><label>Mín.</label><input name="hpa_min" type="number" value="{{ v.autoscaling.minReplicas }}"></div><div><label>Máx.</label><input name="hpa_max" type="number" value="{{ v.autoscaling.maxReplicas }}"></div><div><label>CPU %</label><input name="hpa_cpu" type="number" value="{{ v.autoscaling.targetCPU }}"></div></div>
  <div class="row"><div><label>CPU solicitada</label><input name="req_cpu" value="{{ v.resources.requests.cpu }}"></div><div><label>Memoria solicitada</label><input name="req_mem" value="{{ v.resources.requests.memory }}"></div></div>
  <div class="row"><div><label>CPU límite</label><input name="lim_cpu" value="{{ v.resources.limits.cpu }}"></div><div><label>Memoria límite</label><input name="lim_mem" value="{{ v.resources.limits.memory }}"></div></div></div>
-<div class="card"><h2>Ingress · SSL · Middleware</h2>
+<div class="card"><h2>Ingress · SSL · Middleware</h2>{% if not dueno %}<p class="muted">Lo define tu plan (solo lo cambia el dueño de la plataforma).</p>{% endif %}
  <label class="chk"><input type="checkbox" name="tls" {{ 'checked' if v.tls.enabled }}> HTTPS con certificado {{ v.tls.secretName }}</label>
  <label class="chk"><input type="checkbox" name="ssl_redirect" {{ 'checked' if v.middleware.sslRedirect }}> Forzar HTTPS (redirigir HTTP → HTTPS)</label>
  <label>Límite de solicitudes por minuto por IP (0 = sin límite)</label><input name="rpm" type="number" value="{{ v.middleware.rateLimitRPM }}">
@@ -438,12 +671,12 @@ EDITAR = """{% extends "base.html" %}{% block c %}
  <label class="chk"><input type="checkbox" name="cors" {{ 'checked' if v.middleware.cors }}> Permitir CORS</label>
  <label>Tamaño máximo de petición</label><input name="body" value="{{ v.middleware.proxyBodySize }}">
  <label class="chk"><input type="checkbox" name="dbadmin" {{ 'checked' if v.dbAdmin.enabled }}> Publicar Adminer en db.{{ v.domain }}</label></div>
-</div>
+</fieldset></div>
 <div class="acts"><button class="btn ok" name="accion" value="aplicar">Guardar y aplicar</button>
 <button class="btn sec" name="accion" value="preview">Vista previa (helm template)</button><button class="btn sec" name="accion" value="guardar">Solo guardar</button>
 <a class="btn sec" href="{{ url_for('inicio') }}">Volver</a></div></form>
-<div class="card" style="margin-top:22px"><h2>values.yaml completo</h2><form method="post"><textarea name="raw" rows="18">{{ raw }}</textarea>
-<div class="acts"><button class="btn" name="accion" value="yaml">Guardar YAML y aplicar</button></div></form></div>{% endblock %}"""
+{% if dueno %}<div class="card" style="margin-top:22px"><h2>values.yaml completo</h2><form method="post"><textarea name="raw" rows="18">{{ raw }}</textarea>
+<div class="acts"><button class="btn" name="accion" value="yaml">Guardar YAML y aplicar</button></div></form></div>{% endif %}{% endblock %}"""
 
 TRABAJO = """{% extends "base.html" %}{% block t %}{{ c.nombre }} · despliegue{% endblock %}{% block c %}
 {% if job and job.estado == 'corriendo' %}<meta http-equiv="refresh" content="3">{% endif %}
@@ -467,9 +700,36 @@ BD = """{% extends "base.html" %}{% block c %}<h1>{{ c.nombre }} · base de dato
 <tr><td class="muted">Base de datos</td><td><code>{{ v.database.name }}</code></td></tr></table></div>
 <div class="acts"><a class="btn" href="{{ url_for('inicio') }}">Volver al panel</a></div>{% endblock %}"""
 
+REGISTRO_HTML = """{% extends "base.html" %}{% block c %}
+<h1>Crea tu app</h1><p class="muted">Como en Render: conecta tu repositorio y la plataforma construye, publica con HTTPS y te da una base de datos administrada.</p>
+<form method="post"><div class="grid" style="margin-top:16px">
+<div class="card cuatro"><h2>Tu cuenta</h2>
+ <label>Nombre de la app (será tu usuario y tu subdominio)</label><input name="cid" placeholder="gamma-store" value="{{ f.cid }}" required>
+ <p class="muted">Tu sitio: https://<b>nombre</b>.paas.local</p>
+ <label>Nombre visible</label><input name="nombre" placeholder="Gamma Store" value="{{ f.nombre }}">
+ <label>Contraseña para entrar al panel</label><input name="clave" type="password" required></div>
+<div class="card cuatro"><h2>Los 4 valores</h2>
+ <label>1 · Dominio</label><input value="(se crea solo: nombre.paas.local + certificado SSL)" disabled>
+ <label>2 · Repositorio Git (público)</label><input name="repo" value="{{ f.repo or 'https://github.com/maxi300/paas-parcial2.git' }}">
+ <div class="row"><div><label>Rama</label><input name="branch" value="{{ f.branch or 'main' }}"></div><div><label>Carpeta con el Dockerfile</label><input name="path" value="{{ f.path or 'apps/alpha-node' }}"></div></div>
+ <div class="row"><div><label>3 · Runtime</label><select name="runtime">{% for k, r in runtimes.items() %}<option value="{{ k }}" {{ 'selected' if f.runtime == k }}>{{ r.label }} ({{ r.port }})</option>{% endfor %}</select></div>
+ <div><label>Puerto (vacío = el del runtime)</label><input name="port" type="number" value="{{ f.port }}"></div></div>
+ <label>4 · Base de datos administrada</label><select name="motor">{% for k, m in motores.items() %}<option value="{{ k }}" {{ 'selected' if f.motor == k }}>{{ m }}</option>{% endfor %}</select></div>
+<div class="card"><h2>Plan</h2>{% for k, p in planes.items() %}
+ <label class="chk"><input type="radio" name="plan" value="{{ k }}" {{ 'checked' if (f.plan or 'basico') == k }}> <b>{{ p.label }}</b> · {{ p.hpa[0] }}–{{ p.hpa[1] }} réplicas · disco {{ p.storage }} · {{ p.rpm }} sol/min</label>{% endfor %}
+ <label>Color de tu marca</label><input name="color" type="color" value="{{ f.color or '#7c5cff' }}" style="height:44px"></div>
+</div><div class="acts"><button class="btn ok">Crear y desplegar</button><a class="btn sec" href="{{ url_for('inicio') }}">Ya tengo cuenta</a></div></form>{% endblock %}"""
+
+CREADA = """{% extends "base.html" %}{% block c %}<h1>¡{{ nombre }} se está creando!</h1>
+<div class="card" style="max-width:760px"><p>La plataforma está creando tu namespace, tu certificado SSL, tu base de datos y construyendo tu app desde Git (tarda unos minutos).</p>
+<p>1. Para verla en tu equipo, agrega esta línea a tu archivo <b>hosts</b>:</p><pre>{{ ip }} {{ cid }}.paas.local db.{{ cid }}.paas.local</pre>
+<p>2. Entra a tu panel con el usuario <b>{{ cid }}</b> y tu contraseña para seguir el avance.</p>
+<div class="acts"><a class="btn" href="{{ url_for('trabajo', cid=cid) }}">Ver el avance</a></div></div>{% endblock %}"""
+
 app.jinja_loader = DictLoader({"base.html": BASE, "inicio.html": INICIO, "editar.html": EDITAR,
-                               "trabajo.html": TRABAJO, "salida.html": SALIDA, "bd.html": BD})
+                               "trabajo.html": TRABAJO, "salida.html": SALIDA, "bd.html": BD,
+                               "registro.html": REGISTRO_HTML, "creada.html": CREADA})
 
 if __name__ == "__main__":
-    print(f"Panel PaaS en http://0.0.0.0:5000  (usuario {PANEL_USER})")
+    print("Panel PaaS en http://0.0.0.0:5000  (usuarios: admin = dueño, alpha y beta = clientes)")
     app.run(host="0.0.0.0", port=int(os.environ.get("PANEL_PORT", "5000")), threaded=True)
