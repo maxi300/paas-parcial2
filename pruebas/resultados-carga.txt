@@ -1,0 +1,8 @@
+== Velocidad en reposo (20 peticiones HTTPS por cliente) 2026-10-25 10:17:37
+Cliente              TLS ms  Total ms   Max ms
+alpha.paas.local      175.2     390.6   1088.6
+beta.paas.local       129.9     766.9   2527.4
+== Carga: 10 procesos por cliente durante 180 s (los dos a la vez)
+Cliente            Peticiones  HTTP 200  HTTP 503   Acept/min   Prom ms
+alpha.paas.local          602       602         0         201    1660.1
+beta.paas.local           575       464       107         155    1697.0

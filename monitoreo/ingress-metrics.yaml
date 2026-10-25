@@ -1,0 +1,21 @@
+# Expone las métricas del Ingress NGINX (solicitudes por cliente, códigos HTTP, latencia) a Prometheus
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx-metrics
+  namespace: ingress-nginx
+  labels: {app.kubernetes.io/name: ingress-nginx, paas/metrics: ingress}
+spec:
+  selector: {app.kubernetes.io/name: ingress-nginx, app.kubernetes.io/component: controller}
+  ports: [{name: metrics, port: 10254, targetPort: 10254}]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ingress-nginx
+  namespace: monitoring
+  labels: {release: prometheus}
+spec:
+  namespaceSelector: {matchNames: [ingress-nginx]}
+  selector: {matchLabels: {paas/metrics: ingress}}
+  endpoints: [{port: metrics, interval: 60s}]
