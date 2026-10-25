@@ -240,14 +240,65 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       <div class="col-md-4"><div class="card"><div class="card-body"><div class="text-muted small">Productos</div><div class="fs-3 fw-bold">${products}</div></div></div></div>
       <div class="col-md-4"><div class="card"><div class="card-body"><div class="text-muted small">Atendido por el pod</div><div class="fw-bold"><code>${esc(os.hostname())}</code></div></div></div></div>
     </div>
-    <div class="card"><div class="card-body">
-      <h2 class="h5">Agregar producto</h2>
-      <form method="post" action="/products" class="row g-2">
-        <div class="col-md-6"><input class="form-control" name="name" placeholder="Nombre" required maxlength="120"></div>
-        <div class="col-md-3"><input class="form-control" name="price" type="number" step="0.01" min="0" placeholder="Precio" required></div>
+    <div class="card shadow-sm"><div class="card-body">
+      <h2 class="h5 mb-1">Productos · CRUD con la API REST</h2>
+      <p class="text-muted small mb-3">Este panel no usa formularios clásicos: cada botón llama a la API
+        <code>GET · POST · PUT · DELETE /api/products</code> (autenticada con tu JWT).</p>
+      <form id="nuevo" class="row g-2 mb-3">
+        <div class="col-md-6"><input class="form-control" name="nombre" placeholder="Nombre" required maxlength="120"></div>
+        <div class="col-md-2"><input class="form-control" name="precio" type="number" step="0.01" min="0" placeholder="Precio" required></div>
         <div class="col-md-2"><input class="form-control" name="stock" type="number" min="0" placeholder="Stock" required></div>
-        <div class="col-md-1"><button class="btn btn-primary w-100">+</button></div>
-      </form></div></div>`)
+        <div class="col-md-2"><button class="btn btn-primary w-100">Crear (POST)</button></div>
+      </form>
+      <table class="table align-middle mb-3"><thead><tr><th>ID</th><th>Nombre</th><th style="width:140px">Precio</th><th style="width:110px">Stock</th><th>Acciones</th></tr></thead>
+        <tbody id="filas"><tr><td colspan="5" class="text-muted">Cargando…</td></tr></tbody></table>
+      <h3 class="h6">Respuestas de la API <span class="text-muted small">(lo más reciente arriba)</span></h3>
+      <pre id="log" class="bg-dark text-light p-3 small rounded" style="max-height:260px;overflow:auto;white-space:pre-wrap"></pre>
+    </div></div>
+    <script>
+    const filas = document.getElementById("filas"), log = document.getElementById("log");
+    const escH = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+    async function api(metodo, url, cuerpo, silencioso) {
+      const r = await fetch(url, { method: metodo, credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: cuerpo ? JSON.stringify(cuerpo) : undefined });
+      const texto = await r.text();
+      if (!silencioso) {
+        const hora = new Date().toLocaleTimeString();
+        log.textContent = "[" + hora + "] " + metodo + " " + url + "  ->  HTTP " + r.status + "\\n" +
+          (cuerpo ? "  enviado: " + JSON.stringify(cuerpo) + "\\n" : "") +
+          "  respuesta: " + (texto || "(sin contenido)") + "\\n\\n" + log.textContent;
+      }
+      let datos = null; try { datos = texto ? JSON.parse(texto) : null; } catch (e) {}
+      return { ok: r.ok, datos: datos };
+    }
+    async function cargar(silencioso) {
+      const res = await api("GET", "/api/products", null, silencioso);
+      filas.innerHTML = (res.datos || []).map((p) =>
+        '<tr data-id="' + p.id + '"><td>' + p.id + '</td>' +
+        '<td><input class="form-control form-control-sm" data-c="name" value="' + escH(p.name) + '"></td>' +
+        '<td><input class="form-control form-control-sm" data-c="price" type="number" step="0.01" min="0" value="' + p.price + '"></td>' +
+        '<td><input class="form-control form-control-sm" data-c="stock" type="number" min="0" value="' + p.stock + '"></td>' +
+        '<td class="text-nowrap"><button class="btn btn-sm btn-info" data-a="put">Guardar (PUT)</button> ' +
+        '<button class="btn btn-sm btn-outline-danger" data-a="del">Eliminar (DELETE)</button></td></tr>').join("");
+    }
+    filas.addEventListener("click", async (e) => {
+      const b = e.target.closest("button"); if (!b) return;
+      const tr = b.closest("tr"), id = tr.dataset.id, v = (c) => tr.querySelector('[data-c="' + c + '"]').value;
+      if (b.dataset.a === "del") {
+        if (!confirm("¿Eliminar el producto " + id + "?")) return;
+        await api("DELETE", "/api/products/" + id);
+      } else {
+        await api("PUT", "/api/products/" + id, { name: v("name"), price: Number(v("price")), stock: parseInt(v("stock"), 10) });
+      }
+      cargar(true);
+    });
+    document.getElementById("nuevo").addEventListener("submit", async (e) => {
+      e.preventDefault(); const f = e.target.elements;
+      await api("POST", "/api/products", { name: f.nombre.value, price: Number(f.precio.value), stock: parseInt(f.stock.value, 10) });
+      e.target.reset(); cargar(true);
+    });
+    cargar(false);
+    </script>`)
   );
 });
 
