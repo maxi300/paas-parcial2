@@ -1,0 +1,75 @@
+{{- if and .Values.database.enabled .Values.dbAdmin.enabled }}
+# Adminer: interfaz web de la base de datos, publicada por el Ingress (también con HTTPS)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "paas-app-chart.fullname" . }}-dbadmin
+  labels:
+    {{- include "paas-app-chart.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "paas-app-chart.name" . }}-dbadmin
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "paas-app-chart.name" . }}-dbadmin
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: dbadmin
+    spec:
+      containers:
+        - name: adminer
+          image: adminer:4.8.1
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ADMINER_DEFAULT_SERVER
+              value: {{ include "paas-app-chart.dbName" . | quote }}
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "paas-app-chart.fullname" . }}-dbadmin
+  labels:
+    {{- include "paas-app-chart.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "paas-app-chart.name" . }}-dbadmin
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "paas-app-chart.fullname" . }}-dbadmin
+  labels:
+    {{- include "paas-app-chart.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className | default "nginx" }}
+  {{- if .Values.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ include "paas-app-chart.dbAdminHost" . | quote }}
+      secretName: {{ include "paas-app-chart.tlsSecret" . }}
+  {{- end }}
+  rules:
+    - host: {{ include "paas-app-chart.dbAdminHost" . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "paas-app-chart.fullname" . }}-dbadmin
+                port:
+                  number: 80
+{{- end }}

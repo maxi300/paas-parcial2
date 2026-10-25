@@ -1,0 +1,48 @@
+# ==========================================================
+# CLIENTE 1 · Alpha Tech (tienda de tecnología)
+# Namespace portal-clientes · Node.js 22 + Express + PostgreSQL 16 · Plan Pro
+# Este es el ÚNICO archivo que entrega el cliente (lo edita el panel web).
+# ==========================================================
+runtime: node
+image:
+  repository: alpha-node-app
+  tag: "1.0"
+containerPort: 3000
+domain: "alpha.paas.local"
+env:
+  APP_NAME: "Alpha Tech"
+  TENANT: "portal-clientes"
+  APP_ENV: "produccion"
+  BRAND_COLOR: "#2563eb"
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPU: 70
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits: { cpu: 500m, memory: 256Mi }
+livenessProbe:
+  httpGet: { path: /health, port: http }
+  initialDelaySeconds: 10
+readinessProbe:
+  httpGet: { path: /ready, port: http }
+  initialDelaySeconds: 5
+database:
+  enabled: true
+  engine: postgres
+  version: "16-alpine"
+  name: alpha_db
+  user: alpha_user
+  storage: 2Gi
+dbAdmin:
+  enabled: true
+tls:
+  enabled: true
+  secretName: alpha-tls
+middleware:
+  sslRedirect: false
+  rateLimitRPM: 600
+  stickySessions: false
+  proxyBodySize: 10m
+  cors: true

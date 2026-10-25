@@ -1,0 +1,101 @@
+# Parámetros del PaaS alineados con la práctica
+appName: "mi-web-service"
+replicaCount: 2
+domain: "alpha.paas.local"
+
+image:
+  repository: "nginx"
+  tag: "alpine"
+  pullPolicy: IfNotPresent
+
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 70
+
+# Configuración por defecto requerida por los templates nativos
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+securityContext: {}
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations: {}
+  hosts:
+    - host: alpha.paas.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+
+livenessProbe:
+  httpGet:
+    path: /
+    port: http
+readinessProbe:
+  httpGet:
+    path: /
+    port: http
+
+volumes: []
+volumeMounts: []
+
+nodeSelector: {}
+tolerations: {}
+affinity: {}
+env: {}
+
+# ============ Parcial 2: nuevos parámetros del PaaS (valores por defecto) ============
+runtime: nginx             # node | php | nginx  (informativo; lo elige el panel)
+containerPort: 80          # puerto de la app dentro del contenedor (el Service sigue en el 80)
+
+database:                  # base de datos administrada por la plataforma
+  enabled: false
+  engine: postgres         # postgres | mysql
+  version: ""              # vacío = 16-alpine (postgres) u 8.4 (mysql)
+  name: app_db
+  user: app_user
+  storage: 1Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+
+dbAdmin:                   # Adminer: ver la base de datos desde el navegador (por Ingress)
+  enabled: false
+  host: ""                 # vacío = db.<domain>
+
+tls:                       # HTTPS en el Ingress con el certificado de OpenSSL
+  enabled: false
+  secretName: ""           # vacío = <nombre-del-release>-tls
+
+middleware:                # middlewares del Ingress NGINX
+  sslRedirect: false       # true = redirige HTTP a HTTPS
+  rateLimitRPM: 0          # solicitudes por minuto por IP (0 = sin límite)
+  stickySessions: false    # afinidad por cookie
+  proxyBodySize: 2m        # tamaño máximo de una petición
+  cors: false

@@ -1,0 +1,51 @@
+# ==========================================================
+# CLIENTE 2 · Beta POS (punto de venta de restaurante)
+# Namespace pos-ventas · PHP 8.3 + Apache + MySQL 8.4 · Plan Básico
+# Este es el ÚNICO archivo que entrega el cliente (lo edita el panel web).
+# ==========================================================
+runtime: php
+image:
+  repository: beta-php-app
+  tag: "1.0"
+containerPort: 8080
+domain: "beta.paas.local"
+env:
+  APP_NAME: "Beta POS"
+  TENANT: "pos-ventas"
+  APP_ENV: "produccion"
+  BRAND_COLOR: "#16a34a"
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPU: 70
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits: { cpu: 500m, memory: 256Mi }
+livenessProbe:
+  httpGet: { path: /health.php, port: http }
+  initialDelaySeconds: 10
+readinessProbe:
+  httpGet: { path: "/health.php?ready=1", port: http }
+  initialDelaySeconds: 5
+database:
+  enabled: true
+  engine: mysql
+  version: "8.4"
+  name: beta_db
+  user: beta_user
+  storage: 1Gi
+  resources:
+    requests: { cpu: 100m, memory: 384Mi }
+    limits: { cpu: 500m, memory: 768Mi }
+dbAdmin:
+  enabled: true
+tls:
+  enabled: true
+  secretName: beta-tls
+middleware:
+  sslRedirect: false
+  rateLimitRPM: 120
+  stickySessions: true
+  proxyBodySize: 2m
+  cors: false

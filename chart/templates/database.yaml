@@ -1,0 +1,79 @@
+{{- if .Values.database.enabled }}
+{{- $mysql := eq .Values.database.engine "mysql" }}
+# Base de datos administrada por la plataforma: StatefulSet con disco persistente (PVC)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "paas-app-chart.dbName" . }}
+  labels:
+    {{- include "paas-app-chart.dbLabels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "paas-app-chart.dbLabels" . | nindent 4 }}
+  ports:
+    - name: db
+      port: {{ include "paas-app-chart.dbPort" . }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "paas-app-chart.dbName" . }}
+  labels:
+    {{- include "paas-app-chart.dbLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "paas-app-chart.dbName" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "paas-app-chart.dbLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "paas-app-chart.dbLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: {{ .Values.database.engine }}
+          image: {{ include "paas-app-chart.dbImage" . }}
+          ports:
+            - name: db
+              containerPort: {{ include "paas-app-chart.dbPort" . }}
+          env:
+          {{- if $mysql }}
+            - { name: MYSQL_DATABASE, value: {{ .Values.database.name | quote }} }
+            - { name: MYSQL_USER, value: {{ .Values.database.user | quote }} }
+            - name: MYSQL_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ include "paas-app-chart.dbSecret" . }}, key: DB_PASSWORD } }
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ include "paas-app-chart.dbSecret" . }}, key: DB_ROOT_PASSWORD } }
+          {{- else }}
+            - { name: POSTGRES_DB, value: {{ .Values.database.name | quote }} }
+            - { name: POSTGRES_USER, value: {{ .Values.database.user | quote }} }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ include "paas-app-chart.dbSecret" . }}, key: DB_PASSWORD } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          {{- end }}
+          readinessProbe:
+            exec:
+            {{- if $mysql }}
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 -u root -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
+            {{- else }}
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            {{- end }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.database.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ ternary "/var/lib/mysql" "/var/lib/postgresql/data" $mysql }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.database.storage }}
+{{- end }}
