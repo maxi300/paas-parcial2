@@ -1,37 +1,41 @@
-# ==========================================================
-# CLIENTE 1 · Alpha Tech (tienda de tecnología)
-# Namespace portal-clientes · Node.js 22 + Express + PostgreSQL 16 · Plan Pro
-# Este es el ÚNICO archivo que entrega el cliente (lo edita el panel web).
-# ==========================================================
+# Valores del cliente Alpha Tech · editado desde el PaaS el 2026-10-25 10:42
 runtime: node
 image:
   repository: alpha-node-app
-  tag: "1.0"
+  tag: git-1746196
 containerPort: 3000
-domain: "alpha.paas.local"
+domain: alpha.paas.local
 env:
-  APP_NAME: "Alpha Tech"
-  TENANT: "portal-clientes"
-  APP_ENV: "produccion"
-  BRAND_COLOR: "#2563eb"
+  APP_NAME: Alpha Tech
+  TENANT: portal-clientes
+  APP_ENV: produccion
+  BRAND_COLOR: '#7c3aed'
 autoscaling:
   enabled: true
   minReplicas: 2
   maxReplicas: 5
   targetCPU: 70
 resources:
-  requests: { cpu: 100m, memory: 128Mi }
-  limits: { cpu: 500m, memory: 256Mi }
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
 livenessProbe:
-  httpGet: { path: /health, port: http }
+  httpGet:
+    path: /health
+    port: http
   initialDelaySeconds: 10
 readinessProbe:
-  httpGet: { path: /ready, port: http }
+  httpGet:
+    path: /ready
+    port: http
   initialDelaySeconds: 5
 database:
   enabled: true
   engine: postgres
-  version: "16-alpine"
+  version: 16-alpine
   name: alpha_db
   user: alpha_user
   storage: 2Gi
@@ -46,3 +50,9 @@ middleware:
   stickySessions: false
   proxyBodySize: 10m
   cors: true
+source:
+  repo: https://github.com/maxi300/paas-parcial2.git
+  branch: main
+  path: apps/alpha-node
+  commit: '1746196'
+  deployed: 2026-10-24 23:37
